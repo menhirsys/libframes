@@ -2,7 +2,10 @@
 
 void libframes_write_platform(void *, uint32_t);
 
-libframes_stats_t libframes_stats = { .min_rx_frame_sz = 666 };
+libframes_stats_t libframes_stats = {
+    .min_rx_frame_sz = 666,
+    .write_frame_min_sz = 666
+};
 
 #define LIBFRAMES_RX_RING_SZ (LIBFRAMES_MAX_FRAME_SZ * LIBFRAMES_RX_RING_FRAMES)
 static char rx_ring[LIBFRAMES_RX_RING_SZ];
@@ -14,7 +17,7 @@ static enum {
     READING
 } read_state = NOT_READING;
 
-uint8_t crc8_table[];
+static uint8_t crc8_table[256];
 
 static char frame_buffer[LIBFRAMES_MAX_FRAME_SZ];
 static uint32_t frame_buffer_sz;
@@ -24,7 +27,7 @@ void libframes_inject_rx_ring(void *p, uint32_t sz) {
     uint32_t off = 0;
     while (rx_ring_unread < LIBFRAMES_RX_RING_SZ && off < sz) {
         uint32_t rx_ring_head = rx_ring_tail + rx_ring_unread;
-        if (rx_ring_head > LIBFRAMES_RX_RING_SZ) {
+        if (rx_ring_head >= LIBFRAMES_RX_RING_SZ) {
             rx_ring_head -= LIBFRAMES_RX_RING_SZ;
         }
         rx_ring[rx_ring_head] = ((char *)p)[off];
@@ -35,7 +38,7 @@ void libframes_inject_rx_ring(void *p, uint32_t sz) {
 
 int libframes_read_begin(uint32_t *p_sz) {
     // Check that we are not already reading a frame.
-    if (read_state != NOT_READING) {
+    if (read_state == READING) {
         return LIBFRAMES_ERROR_NOT_READY;
     }
 
@@ -58,12 +61,9 @@ int libframes_read_begin(uint32_t *p_sz) {
                     libframes_stats.rx_frame_rejected_encoding_error++;
                     return LIBFRAMES_READ_ERROR_BAD_ENCODING;
                 }
-                // Is it at least the minimum frame?
+                // Is it at least the minimum frame? Must at least have crc8.
                 if (frame_buffer_sz < 1) {
                     libframes_stats.rx_frame_rejected_too_small++;
-                    // If there is any error, we need to restore the ending
-                    // frame byte since it may actually be the starting frame
-                    // byte of a following, nonbroken frame.
                     return LIBFRAMES_READ_ERROR_TOO_SMALL;
                 }
                 // running_crc8 should have been xor'ed with the frame crc8,
@@ -81,10 +81,13 @@ int libframes_read_begin(uint32_t *p_sz) {
                 if (frame_buffer_sz > libframes_stats.max_rx_frame_sz) {
                     libframes_stats.max_rx_frame_sz = frame_buffer_sz;
                 }
+                // Read past the terminating LIM.
+                rx_ring_tail = rx_ring_tail + 1 == LIBFRAMES_RX_RING_SZ ? 0 : rx_ring_tail + 1;
+                rx_ring_unread--;
                 // Ready to read frame!
                 read_state = READING;
                 *p_sz = frame_buffer_sz;
-                return LIBFRAMES_NO_ERROR;
+                return 0;
             }
         } else if (limit_bytes_found == 1) {
             // Is the frame too big yet?
@@ -112,7 +115,7 @@ int libframes_read_begin(uint32_t *p_sz) {
             libframes_stats.rx_false_starts++;
         }
 
-        rx_ring_tail = rx_ring_tail + 1 > LIBFRAMES_RX_RING_SZ ? 0 : rx_ring_tail + 1;
+        rx_ring_tail = rx_ring_tail + 1 == LIBFRAMES_RX_RING_SZ ? 0 : rx_ring_tail + 1;
         rx_ring_unread--;
     }
 
@@ -143,26 +146,26 @@ int libframes_read(void *p, uint32_t sz, uint32_t *sz_read) {
         libframes_stats.read_overreach++;
     }
 
-    return LIBFRAMES_NO_ERROR;
+    return 0;
 }
 
 int libframes_read_exact(void *p, uint32_t sz) {
     uint32_t sz_read;
     int err;
     // If libframes_read returns an error, pass it on.
-    if (err = libframes_read(p, sz, &sz_read)) {
+    if ((err = libframes_read(p, sz, &sz_read))) {
         return err;
     }
     // If we didn't read as much as we wanted, that's an error too.
     if (sz_read != sz) {
         return LIBFRAMES_READ_ERROR_NOT_ENOUGH;
     }
-    return LIBFRAMES_NO_ERROR;
+    return 0;
 }
 
 uint32_t libframes_read_end(void) {
     // Check that we are reading a frame.
-    if (read_state != READING) {
+    if (read_state == NOT_READING) {
         return LIBFRAMES_ERROR_NOT_READY;
     }
 
@@ -177,14 +180,15 @@ uint32_t libframes_read_end(void) {
     // Not reading anymore.
     read_state = NOT_READING;
 
-    return LIBFRAMES_NO_ERROR;
+    return 0;
 }
 
 static enum {
     NOT_WRITING,
     WRITING
 } write_state = NOT_WRITING;
-uint8_t writing_running_crc8;
+static uint8_t writing_running_crc8;
+static uint32_t writing_frame_sz;
 
 int libframes_write_begin(void) {
     if (write_state == WRITING) {
@@ -197,8 +201,9 @@ int libframes_write_begin(void) {
     // Write out the first LIM.
     uint8_t b = LIBFRAMES_LIM;
     libframes_write_platform(&b, 1);
+    writing_frame_sz = 1;
 
-    return LIBFRAMES_NO_ERROR;
+    return 0;
 }
 
 int libframes_write(void *p, uint32_t sz) {
@@ -213,12 +218,16 @@ int libframes_write(void *p, uint32_t sz) {
         if (b == LIBFRAMES_DLE || b == LIBFRAMES_LIM) {
             uint8_t escaped[] = {LIBFRAMES_DLE, b ^ LIBFRAMES_XOR};
             libframes_write_platform(&escaped, sizeof(escaped));
+            writing_frame_sz += 2;
         } else {
             libframes_write_platform(&b, 1);
+            writing_frame_sz += 1;
         }
     }
 
-    return LIBFRAMES_NO_ERROR;
+    libframes_stats.write_byte_count += sz;
+
+    return 0;
 }
 
 int libframes_write_end(void) {
@@ -230,12 +239,23 @@ int libframes_write_end(void) {
     libframes_write(&writing_running_crc8, 1);
     uint8_t b = LIBFRAMES_LIM;
     libframes_write_platform(&b, 1);
+    writing_frame_sz++;
+    libframes_stats.write_byte_count++;
+
+    // Update some stats.
+    libframes_stats.write_frame_count++;
+    if (writing_frame_sz < libframes_stats.write_frame_min_sz) {
+        libframes_stats.write_frame_min_sz = writing_frame_sz;
+    }
+    if (writing_frame_sz > libframes_stats.write_frame_max_sz) {
+        libframes_stats.write_frame_max_sz = writing_frame_sz;
+    }
 
     write_state = NOT_WRITING;
-    return LIBFRAMES_NO_ERROR;
+    return 0;
 }
 
-uint8_t crc8_table[] = {
+static uint8_t crc8_table[256] = {
     0x00, 0x07, 0x0e, 0x09, 0x1c, 0x1b, 0x12, 0x15,
     0x38, 0x3f, 0x36, 0x31, 0x24, 0x23, 0x2a, 0x2d,
     0x70, 0x77, 0x7e, 0x79, 0x6c, 0x6b, 0x62, 0x65,

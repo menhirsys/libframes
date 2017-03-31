@@ -18,4 +18,13 @@
         } \
     } while(0);
 
+#define EXPECT_NOT(e1, e2) \
+    do { \
+        int v1 = (e1); \
+        if (v1 == e2) { \
+            printf(__FILE__ ", L" xstr(__LINE__) ": expected not " xstr(e2) ", got: %i\n", v1); \
+            exit(1); \
+        } \
+    } while(0);
+
 #endif

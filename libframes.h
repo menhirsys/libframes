@@ -45,7 +45,6 @@ typedef struct {
         write_byte_count;
 } libframes_stats_t;
 
-#define LIBFRAMES_NO_ERROR 0
 #define LIBFRAMES_ERROR_NOT_READY 1
 #define LIBFRAMES_READ_ERROR_NO_FRAME 2
 #define LIBFRAMES_READ_ERROR_NOT_ENOUGH 3
